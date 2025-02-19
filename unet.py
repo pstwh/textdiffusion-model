@@ -31,7 +31,7 @@ def get_transform(image_size: int):
     return A.Compose(
         [
             A.SmallestMaxSize(max_size=image_size),
-            A.RandomCrop(height=image_size, width=image_size),
+            A.AtLeastOneBBoxRandomCrop(height=image_size, width=image_size),
             ToTensorV2(),
         ],
         bbox_params=A.BboxParams(format="pascal_voc", label_fields=["labels"]),
@@ -52,6 +52,7 @@ class MaskTextDataset(Dataset):
         self.transform = transform
         self.tokenizer = tokenizer
         self.image_paths = glob(glob_path)
+        print('Length of image_paths', len(self.image_paths))
 
     def __len__(self):
         return len(self.image_paths)
@@ -125,7 +126,7 @@ def parse_args():
         "--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"]
     )
     parser.add_argument("--glob_path", type=str, default="data/processed/*/*.jpg")
-    parser.add_argument("--image_size", type=int, default=256)
+    parser.add_argument("--image_size", type=int, default=512)
     return parser.parse_args()
 
 
@@ -175,7 +176,7 @@ def main(args):
     if gradient_checkpointing and hasattr(unet, "enable_gradient_checkpointing"):
         unet.enable_gradient_checkpointing()
     unet.to(device)
-
+    
     optimizer = torch.optim.AdamW(unet.parameters(), lr=learning_rate)
 
     transform = get_transform(image_size)
@@ -222,18 +223,14 @@ def main(args):
                 latents = latents * vae.config.scaling_factor
                 noise = torch.randn_like(latents)
                 latent_h, latent_w = latents.shape[-2], latents.shape[-1]
+
                 if mask.dim() == 3:
                     mask = mask.unsqueeze(1)
-                mask_resized = torch.nn.functional.interpolate(
+                masked_image_latents = torch.nn.functional.interpolate(
                     mask, size=(latent_h, latent_w), mode="nearest"
                 )
-                mask_resized = mask_resized.to(weight_dtype)
-                mask_resized = mask_resized.repeat(1, 3, 1, 1)  # check
-                masked_image_latents = vae.encode(mask_resized).latent_dist.sample()
-                masked_image_latents = masked_image_latents * vae.config.scaling_factor
-                masked_image_latents = torch.nn.functional.interpolate(
-                    masked_image_latents, size=(latent_h, latent_w), mode="nearest"
-                )  # check
+                masked_image_latents = masked_image_latents.to(weight_dtype)
+
                 bsz = latents.shape[0]
                 timesteps = torch.randint(
                     0,
@@ -241,7 +238,10 @@ def main(args):
                     (bsz,),
                     device=latents.device,
                 ).long()
+
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                noisy_latents = latents * (1 - masked_image_latents) + noisy_latents * masked_image_latents
+
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
@@ -250,16 +250,17 @@ def main(args):
                     raise ValueError(
                         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                     )
-                model_input_latents = torch.cat(
-                    [noisy_latents, mask_resized, masked_image_latents], dim=1
-                )
+                
+                model_input_latents = noisy_latents
+                text_embeddings = text_embeddings.unsqueeze(0)
+
                 model_output = unet(model_input_latents, timesteps, text_embeddings)
                 model_pred = model_output.sample
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
             loss = loss / gradient_accumulation_steps
             if scaler is not None:
                 scaler.scale(loss).backward()
-            else:
+            else:   
                 loss.backward()
             accumulation_counter += 1
             if accumulation_counter % gradient_accumulation_steps == 0:
